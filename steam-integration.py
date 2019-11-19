@@ -22,13 +22,11 @@ class ProcessProcesser(GObject.GObject, Thread):
         try:
             self.win.emit(line)
         except Exception:
-            # print('huhhhh')
             pass
 
     def run(self):
         t = current_thread()
         while getattr(t, "alive", True) and self.proc.poll() == None:
-            # print('a')
             line = self.proc.stdout.readline().rstrip('\n')
             if(line == ""): continue
             print('[Thread] from child: ', line)
@@ -44,13 +42,6 @@ class ProcessProcesser(GObject.GObject, Thread):
 
 class SteamGuardDialog(Gtk.Dialog):
     def __init__(self, parent):
-
-        # self.guardGrid = Gtk.Grid()
-        # self.guardInput = Gtk.Entry()
-        # self.guardButton = Gtk.Button(label="Login")
-        # self.guardButton.connect("clicked", self.doSteamGuard)
-        # self.guardGrid.attach(self.guardInput, 0, 0, 1, 1)
-        # self.guardGrid.attach(self.guardButton, 0, 1, 1, 1)
 
         Gtk.Dialog.__init__(self, "Steam Guard", parent, 0)
 
@@ -198,8 +189,6 @@ def main():
 
     win = LoginWindow(proc)
 
-    # thread = Thread(target=processProc, args=[proc, win])
-    # thread.start()
     processor = ProcessProcesser(proc,win)
     processor.start()
 

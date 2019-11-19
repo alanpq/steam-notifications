@@ -13,8 +13,6 @@
   "author": "Alan Panayotov",
   "license": "ISC",
   "dependencies": {
-    "node-gtk": "^0.3.0",
-    "steam-user": "^4.12.4",
-    "steamcommunity": "^3.41.3"
+    "steam-user": "^4.12.4"
   }
 }

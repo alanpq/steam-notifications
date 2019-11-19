@@ -31,10 +31,10 @@ class ProcessProcesser(GObject.GObject, Thread):
             if(line == ""): continue
             print('[Thread] from child: ', line)
             if line == "logged in: false":
-                call(["dunstify", "-a", "Steam", "-u", "normal", "steam-integration failed to log in"])
+                call(["dunstify", "-a", "Steam", "-u", "normal", "steam-notifications failed to log in"])
                 self.proc.kill()
             elif line == "logged in: true":
-                call(["dunstify", "-a", "Steam", "-u", "normal", "steam-integration loaded successfully!"])
+                call(["dunstify", "-a", "Steam", "-u", "normal", "steam-notifications loaded successfully!"])
                 self.win.hide()
             GLib.idle_add(lambda: self.emit(line))
         print('Child process handler thread closing...')
@@ -126,7 +126,7 @@ class LoginWindow(Gtk.Window, GObject.GObject):
         self.error.set_size_request(40, 40)
         self.error.set_single_line_mode(False)
 
-        l = Gtk.Label(label="<span size='larger' weight='bold'>Steam Integration Login</span>")
+        l = Gtk.Label(label="<span size='larger' weight='bold'>Steam Notifications Login</span>")
         l.set_use_markup(True)
         l.set_margin_bottom(20)
         self.grid.attach(l, 0, 0, 1, 1)

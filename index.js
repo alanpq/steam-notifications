@@ -27,7 +27,7 @@ var LOGGED_IN = false;
 console.log('NodeJS child active!')
 
 process.stdin.on('data', function (text) {
-    console.log('received data:', text.toString());
+    // console.log('received data:', text.toString()); // line is risky as it can output sensitive data
     try {
         let req = JSON.parse(text.toString())
         console.log(Object.keys(req))

@@ -1,6 +1,11 @@
 use std::{
+    collections::HashMap,
     io::{Cursor, Read, Write},
     net::{SocketAddr, ToSocketAddrs},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64},
+    },
     time::Instant,
 };
 
@@ -18,18 +23,90 @@ use steam_types::{
 use tokio::{
     io::{BufReader, BufWriter},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+    sync::{Mutex, mpsc, oneshot},
+    task::JoinHandle,
 };
 
-use crate::crypto::SessionKey;
+use crate::{
+    crypto::SessionKey,
+    transport::{Header, Message},
+};
 
 pub mod crypto;
+pub mod transport;
 
-struct Client {}
+struct Client {
+    conn: transport::Transport,
+    msg_handle: JoinHandle<()>,
+    msg_rx: mpsc::Receiver<Message>,
+    job_counter: AtomicU64,
+    callbacks: CallbackMap,
+}
 
-struct TCPConnection {
-    read: BufReader<OwnedReadHalf>,
-    write: BufWriter<OwnedWriteHalf>,
-    session_key: Option<SessionKey>,
+type CallbackMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Message>>>>;
+impl Client {
+    pub fn new(connection: transport::Transport, mut message_rx: mpsc::Receiver<Message>) -> Self {
+        let (tx, rx) = mpsc::channel(1024);
+        let callbacks = CallbackMap::default();
+        Self {
+            conn: connection,
+            callbacks: callbacks.clone(),
+            msg_rx: rx,
+            msg_handle: tokio::spawn(async move {
+                while let Some(msg) = message_rx.recv().await {
+                    if let Some(job_target) = msg.job_target()
+                        && let Some(callback) = callbacks.lock().await.remove(&job_target)
+                    {
+                        let _ = callback.send(msg);
+                    } else {
+                        let _ = tx.send(msg).await;
+                    }
+                }
+            }),
+            job_counter: Default::default(),
+        }
+    }
+
+    pub async fn read(&mut self) -> Option<Message> {
+        self.msg_rx.recv().await
+    }
+
+    pub async fn call<M: Method>(&self, method: M) -> anyhow::Result<Message> {
+        let job_id = self
+            .job_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let header = Header::Proto(
+            CMsgProtoBufHeader {
+                target_job_name: Some(M::TARGET_JOB_NAME.to_string()),
+                jobid_source: Some(job_id),
+                realm: Some(1),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        let (tx, rx) = oneshot::channel();
+        self.callbacks.lock().await.insert(job_id, tx);
+
+        self.conn
+            .send(Message {
+                emsg: EMsg::KEMsgServiceMethodCallFromClientNonAuthed,
+                header,
+                body: method.encode_to_vec(),
+            })
+            .await?;
+
+        Ok(rx.await?)
+    }
+}
+
+trait Method: steam_types::prost::Message {
+    const TARGET_JOB_NAME: &'static str;
+}
+
+impl Method for CAuthenticationGetPasswordRsaPublicKeyRequest {
+    const TARGET_JOB_NAME: &'static str = "Authentication.GetPasswordRSAPublicKey#1";
 }
 
 const MAGIC: &[u8] = b"VT01";
@@ -40,198 +117,6 @@ const JOBID_NONE: JobId = 18446744073709551615;
 type JobId = u64;
 type SteamId = u64;
 type SessionId = u32;
-
-#[derive(Debug)]
-enum Header {
-    EMsg {
-        target_job: JobId,
-        source_job: JobId,
-        steam_and_session: Option<(SteamId, SessionId)>,
-    },
-    Proto(Box<CMsgProtoBufHeader>),
-}
-
-#[derive(Debug)]
-struct Message {
-    emsg: EMsg,
-    header: Header,
-    body: Vec<u8>,
-}
-
-impl TCPConnection {
-    pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
-        let socket = tokio::net::TcpSocket::new_v4()?;
-        let (read, write) = socket.connect(addr).await?.into_split();
-
-        let read = BufReader::new(read);
-        let write = BufWriter::new(write);
-
-        Ok(Self {
-            read,
-            write,
-            session_key: None,
-        })
-    }
-
-    pub async fn send_proto(
-        &mut self,
-        message: impl steam_types::prost::Message,
-    ) -> anyhow::Result<()> {
-        let len = message.encoded_len();
-        let mut buf = Vec::with_capacity(4 + 4 + len);
-        buf.write_u32::<LE>(len as _)?;
-        buf.write_all(MAGIC)?;
-        message.encode(&mut buf)?;
-
-        let mut buf = Cursor::new(buf);
-        {
-            use tokio::io::AsyncWriteExt as _;
-            self.write.write_all_buf(&mut buf).await?;
-            self.write.flush().await?;
-        }
-        Ok(())
-    }
-
-    pub async fn send_raw(&mut self, bytes: impl AsRef<[u8]>) -> anyhow::Result<()> {
-        let bytes = bytes.as_ref();
-        use tokio::io::AsyncWriteExt as _;
-        match self.session_key.as_ref() {
-            Some(key) => {
-                let bytes = crypto::symmetric_encrypt_with_hmac_iv(bytes, &key.plain);
-
-                self.write
-                    .write_u32_le(bytes.len().try_into().unwrap())
-                    .await?;
-                self.write.write_all_buf(&mut Cursor::new(MAGIC)).await?;
-                self.write.write_all_buf(&mut Cursor::new(bytes)).await?;
-            }
-            None => {
-                self.write
-                    .write_u32_le(bytes.len().try_into().unwrap())
-                    .await?;
-                self.write.write_all_buf(&mut Cursor::new(MAGIC)).await?;
-                self.write.write_all_buf(&mut Cursor::new(bytes)).await?;
-            }
-        }
-        self.write.flush().await?;
-        Ok(())
-    }
-
-    pub async fn send(&mut self, mut message: Message) -> anyhow::Result<()> {
-        println!("-> \x1b[34m{:?}\x1b[0m: {:?}", message.emsg, message.header);
-        match message.header {
-            Header::EMsg {
-                target_job,
-                source_job,
-                steam_and_session,
-            } => {
-                let mut buf = if message.emsg == EMsg::KEMsgChannelEncryptResponse {
-                    let mut buf = Vec::with_capacity(4 + 8 + 8);
-                    buf.write_u32::<LE>(i32::from(message.emsg) as u32)?;
-                    buf.write_u64::<LE>(target_job)?;
-                    buf.write_u64::<LE>(source_job)?;
-                    buf
-                } else {
-                    let mut buf = Vec::with_capacity(4 + 1 + 2 + 8 + 8 + 1 + 8 + 4);
-                    buf.write_u32::<LE>(i32::from(message.emsg) as u32)?;
-                    buf.write_u8(36)?;
-                    buf.write_u16::<LE>(2)?;
-                    buf.write_u64::<LE>(target_job)?;
-                    buf.write_u64::<LE>(source_job)?;
-                    buf.write_u8(239)?;
-                    let (steam_id, session_id) = steam_and_session.unwrap_or_default();
-                    buf.write_u64::<LE>(steam_id)?;
-                    buf.write_u32::<LE>(session_id)?;
-                    buf
-                };
-                buf.append(&mut message.body);
-                self.send_raw(&buf).await?;
-            }
-            Header::Proto(proto) => {
-                let mut header = proto.encode_to_vec();
-                let mut buf = Vec::with_capacity(4 + 4 + header.len() + message.body.len());
-                buf.write_u32::<LE>(i32::from(message.emsg) as u32 | PROTO_MASK)?;
-                buf.write_u32::<LE>(header.len().try_into().unwrap())?;
-                buf.append(&mut header);
-                buf.append(&mut message.body);
-                self.send_raw(&buf).await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn read_message(&mut self) -> anyhow::Result<Message> {
-        use tokio::io::AsyncReadExt;
-        let msg_len =
-            usize::try_from(self.read.read_u32_le().await.context("reading msg len")?).unwrap();
-        let mut magic = [0_u8; 4];
-        self.read.read_exact(&mut magic).await?;
-        if magic != MAGIC {
-            println!("{magic:x?}");
-            anyhow::bail!("Connection out of sync");
-        }
-
-        println!("got msg of len {msg_len}");
-        let mut msg = vec![0; msg_len];
-        self.read.read_exact(&mut msg).await?;
-
-        if let Some(key) = self.session_key.as_ref() {
-            msg = crypto::symmetric_decrypt(&msg, &key.plain, true)?;
-        }
-
-        let mut msg = Cursor::new(msg);
-        let raw_emsg = ReadBytesExt::read_u32::<LE>(&mut msg)?;
-
-        let emsg = EMsg::try_from((raw_emsg & !PROTO_MASK) as i32)?;
-        let is_protobuf = (raw_emsg & PROTO_MASK) != 0;
-
-        let header = if is_protobuf {
-            let len = ReadBytesExt::read_u32::<LE>(&mut msg)?;
-            let proto = CMsgProtoBufHeader::decode(Buf::take(&mut msg, len.try_into().unwrap()))?;
-            Header::Proto(proto.into())
-        } else {
-            match emsg {
-                EMsg::KEMsgChannelEncryptRequest | EMsg::KEMsgChannelEncryptResult => {
-                    Header::EMsg {
-                        target_job: ReadBytesExt::read_u64::<LE>(&mut msg)?,
-                        source_job: ReadBytesExt::read_u64::<LE>(&mut msg)?,
-                        steam_and_session: None,
-                    }
-                }
-                _ => {
-                    let _header_size = ReadBytesExt::read_u8(&mut msg)?; // always 36
-                    let _header_version = ReadBytesExt::read_u16::<LE>(&mut msg)?; // always 2
-
-                    let target_job = ReadBytesExt::read_u64::<LE>(&mut msg)?;
-                    let source_job = ReadBytesExt::read_u64::<LE>(&mut msg)?;
-
-                    let _canary = ReadBytesExt::read_u8(&mut msg)?; // always 239
-                    Header::EMsg {
-                        target_job,
-                        source_job,
-                        steam_and_session: Some((
-                            ReadBytesExt::read_u64::<LE>(&mut msg)?,
-                            ReadBytesExt::read_u32::<LE>(&mut msg)?,
-                        )),
-                    }
-                }
-            }
-        };
-
-        let pos = usize::try_from(msg.position()).unwrap();
-        Ok(Message {
-            emsg,
-            header,
-            body: msg.into_inner().drain(pos..).collect(),
-        })
-
-        // EMsg::decode();
-        // steam_types::prost::Message::dec
-
-        // Ok(msg)
-    }
-}
 
 const PROTOCOL_VERSION: u32 = 65580;
 
@@ -249,49 +134,16 @@ struct GetPasswordRSAPublicKey {
     account_name: String,
 }
 
-async fn encrypt_password(conn: &mut TCPConnection, account_name: String) -> anyhow::Result<()> {
-    // let body = serde_qs::to_string(&GetPasswordRSAPublicKey {
-    //     format: "vdf".into(),
-    //     account_name,
-    // })?;
-    // let rsa_info = reqwest::get(
-    //     format!("https://{API_HOSTNAME}/Authentication/GetPasswordRSAPublicKey/v1?{body}")
-    //         .parse::<Url>()
-    //         .unwrap(),
-    // )
-    // .await?
-    // .error_for_status()?;
-    // let rsa_info = rsa_info.text().await?;
-    // let rsa_info = steam_vdf_parser::parse_text(rsa_info.trim())?;
-    // dbg!(&rsa_info);
-
+async fn encrypt_password(client: &mut Client, account_name: String) -> anyhow::Result<()> {
     println!("sending encrypt password req for {account_name:?}");
-    conn.send(Message {
-        emsg: EMsg::KEMsgServiceMethodCallFromClientNonAuthed,
-        header: Header::Proto(
-            CMsgProtoBufHeader {
-                target_job_name: Some("Authentication.GetPasswordRSAPublicKey#1".into()),
-                jobid_source: Some(1234),
-                jobid_target: Some(JOBID_NONE),
-                client_sessionid: Some(0),
-                steamid: Some(0),
-                realm: Some(1),
-                ..Default::default()
-            }
-            .into(),
-        ),
-        body: CAuthenticationGetPasswordRsaPublicKeyRequest {
+    let key = client
+        .call(CAuthenticationGetPasswordRsaPublicKeyRequest {
             account_name: Some(account_name),
-        }
-        .encode_to_vec(),
-    })
-    .await?;
-    tokio::io::AsyncWriteExt::flush(&mut conn.write).await?;
-    println!("reading msg");
-    let msg = conn.read_message().await?;
-    dbg!(&msg);
+        })
+        .await?;
 
-    //
+    println!("{key:?}");
+
     // let rsa_key = rsa::RsaPublicKey::new(rsa_info.get_str(path), e)
     Ok(())
 }
@@ -342,7 +194,8 @@ async fn main() -> anyhow::Result<()> {
         .next()
         .unwrap();
     println!("addr: {addr:?}");
-    let mut conn = TCPConnection::connect(addr).await.unwrap();
+    let (conn, msg_rx) = transport::Transport::connect(addr).await.unwrap();
+    let mut client = Client::new(conn, msg_rx);
     println!("connected to CM.");
 
     // let hello = steam_types::CMsgClientHello {
@@ -356,8 +209,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut tmp_session_key = None;
 
-    loop {
-        let msg = conn.read_message().await?;
+    println!("reading next m");
+    while let Some(msg) = client.read().await {
         match msg.header {
             Header::Proto(proto) => {
                 println!("<- proto: {proto:x?}");
@@ -396,16 +249,18 @@ async fn main() -> anyhow::Result<()> {
 
                     tmp_session_key.replace(session_key);
 
-                    conn.send(Message {
-                        emsg: EMsg::KEMsgChannelEncryptResponse,
-                        header: Header::EMsg {
-                            target_job: JOBID_NONE,
-                            source_job: JOBID_NONE,
-                            steam_and_session: Some((76561198312268312, 0)),
-                        },
-                        body: enc_resp,
-                    })
-                    .await?;
+                    client
+                        .conn
+                        .send(Message {
+                            emsg: EMsg::KEMsgChannelEncryptResponse,
+                            header: Header::EMsg {
+                                target_job: JOBID_NONE,
+                                source_job: JOBID_NONE,
+                                steam_and_session: Some((76561198312268312, 0)),
+                            },
+                            body: enc_resp,
+                        })
+                        .await?;
                 }
                 EMsg::KEMsgChannelEncryptResult => {
                     let mut body = Cursor::new(msg.body);
@@ -415,33 +270,39 @@ async fn main() -> anyhow::Result<()> {
                         anyhow::bail!("encryption failed - {eresult}");
                     }
 
-                    conn.session_key.replace(
-                        tmp_session_key
-                            .take()
-                            .expect("session key request must have been made"),
-                    );
+                    client
+                        .conn
+                        .set_key(
+                            tmp_session_key
+                                .take()
+                                .expect("session key request must have been made")
+                                .plain,
+                        )
+                        .await;
 
                     println!("encryption success, logging on...");
 
-                    conn.send(Message {
-                        emsg: EMsg::KEMsgClientHello,
-                        header: Header::Proto(
-                            CMsgProtoBufHeader {
-                                jobid_source: Some(JOBID_NONE),
-                                jobid_target: Some(JOBID_NONE),
-                                client_sessionid: Some(0),
-                                steamid: Some(0),
-                                ..Default::default()
+                    client
+                        .conn
+                        .send(Message {
+                            emsg: EMsg::KEMsgClientHello,
+                            header: Header::Proto(
+                                CMsgProtoBufHeader {
+                                    jobid_source: Some(JOBID_NONE),
+                                    jobid_target: Some(JOBID_NONE),
+                                    client_sessionid: Some(0),
+                                    steamid: Some(0),
+                                    ..Default::default()
+                                }
+                                .into(),
+                            ),
+                            body: CMsgClientHello {
+                                protocol_version: Some(PROTOCOL_VERSION),
                             }
-                            .into(),
-                        ),
-                        body: CMsgClientHello {
-                            protocol_version: Some(PROTOCOL_VERSION),
-                        }
-                        .encode_to_vec(),
-                    })
-                    .await?;
-                    encrypt_password(&mut conn, account_name.clone()).await?;
+                            .encode_to_vec(),
+                        })
+                        .await?;
+                    encrypt_password(&mut client, account_name.clone()).await?;
 
                     // let now = Instant::now();
                     //
@@ -481,4 +342,5 @@ async fn main() -> anyhow::Result<()> {
             },
         }
     }
+    Ok(())
 }
